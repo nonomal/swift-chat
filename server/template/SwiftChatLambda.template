@@ -1,12 +1,8 @@
 {
   "Parameters": {
-    "ApiKeyParam": {
+    "ContainerImageUri": {
       "Type": "String",
-      "AllowedPattern": ".+",
-      "ConstraintDescription": "ApiKeyParam cannot be empty",
-      "Description": "API Key Parameter name for authentication",
-      "MinLength": 1,
-      "NoEcho": false
+      "Description": "The ECR image URI for the Lambda function (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/swift-chat-api:latest)"
     }
   },
   "Resources": {
@@ -44,6 +40,15 @@
                   "Action": [
                     "bedrock:InvokeModel",
                     "bedrock:InvokeModelWithResponseStream"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "bedrock-mantle:CreateInference",
+                    "bedrock-mantle:Get*",
+                    "bedrock-mantle:List*"
                   ],
                   "Resource": "*"
                 }
@@ -103,31 +108,12 @@
             },
             {
               "Action": [
-                "ssm:DescribeParameters",
-                "ssm:GetParameter",
-                "ssm:GetParameterHistory",
-                "ssm:GetParameters"
+                "bedrock-mantle:CreateInference",
+                "bedrock-mantle:Get*",
+                "bedrock-mantle:List*"
               ],
               "Effect": "Allow",
-              "Resource": {
-                "Fn::Join": [
-                  "",
-                  [
-                    "arn:aws:ssm:",
-                    {
-                      "Ref": "AWS::Region"
-                    },
-                    ":",
-                    {
-                      "Ref": "AWS::AccountId"
-                    },
-                    ":parameter/",
-                    {
-                      "Ref": "ApiKeyParam"
-                    }
-                  ]
-                ]
-              }
+              "Resource": "*"
             },
             {
               "Action": "sts:AssumeRole",
@@ -161,27 +147,11 @@
         ],
         "Code": {
           "ImageUri": {
-            "Fn::Join": [
-              "",
-              [
-                "366590864501.dkr.ecr.",
-                {
-                  "Ref": "AWS::Region"
-                },
-                ".",
-                {
-                  "Ref": "AWS::URLSuffix"
-                },
-                "/swift-chat-api:latest-arm64"
-              ]
-            ]
+            "Ref": "ContainerImageUri"
           }
         },
         "Environment": {
           "Variables": {
-            "API_KEY_NAME": {
-              "Ref": "ApiKeyParam"
-            },
             "AWS_LWA_INVOKE_MODE": "RESPONSE_STREAM",
             "CLIENT_ROLE_ARN": {
               "Fn::GetAtt": [
@@ -193,6 +163,7 @@
         },
         "MemorySize": 512,
         "PackageType": "Image",
+        "ReservedConcurrentExecutions": 50,
         "Role": {
           "Fn::GetAtt": [
             "LambdaExecutionRoleD5C26073",
@@ -209,37 +180,250 @@
         "aws:cdk:path": "SwiftChatAPILambda/APIHandler/Resource"
       }
     },
-    "APIHandlerFunctionUrlD2500C9A": {
-      "Type": "AWS::Lambda::Url",
+    "SwiftChatApi": {
+      "Type": "AWS::ApiGateway::RestApi",
       "Properties": {
-        "AuthType": "NONE",
-        "InvokeMode": "RESPONSE_STREAM",
-        "TargetFunctionArn": {
-          "Fn::GetAtt": [
-            "APIHandler68F11976",
-            "Arn"
-          ]
+        "Name": "SwiftChatApi",
+        "Description": "API Gateway for SwiftChat with response streaming",
+        "EndpointConfiguration": {
+          "Types": ["REGIONAL"]
         }
       },
       "Metadata": {
-        "aws:cdk:path": "SwiftChatAPILambda/APIHandler/FunctionUrl/Resource"
+        "aws:cdk:path": "SwiftChatAPILambda/SwiftChatApi/Resource"
       }
     },
-    "APIHandlerinvokefunctionurl0B3BB28F": {
-      "Type": "AWS::Lambda::Permission",
+    "SwiftChatApiProxyResource": {
+      "Type": "AWS::ApiGateway::Resource",
       "Properties": {
-        "Action": "lambda:InvokeFunctionUrl",
-        "FunctionName": {
-          "Fn::GetAtt": [
-            "APIHandler68F11976",
-            "Arn"
-          ]
+        "RestApiId": {
+          "Ref": "SwiftChatApi"
         },
-        "FunctionUrlAuthType": "NONE",
-        "Principal": "*"
+        "ParentId": {
+          "Fn::GetAtt": ["SwiftChatApi", "RootResourceId"]
+        },
+        "PathPart": "{proxy+}"
       },
       "Metadata": {
-        "aws:cdk:path": "SwiftChatAPILambda/APIHandler/invoke-function-url"
+        "aws:cdk:path": "SwiftChatAPILambda/SwiftChatApi/ProxyResource"
+      }
+    },
+    "SwiftChatApiRootMethod": {
+      "Type": "AWS::ApiGateway::Method",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "SwiftChatApi"
+        },
+        "ResourceId": {
+          "Fn::GetAtt": ["SwiftChatApi", "RootResourceId"]
+        },
+        "HttpMethod": "ANY",
+        "AuthorizationType": "NONE",
+        "ApiKeyRequired": true,
+        "Integration": {
+          "Type": "AWS_PROXY",
+          "IntegrationHttpMethod": "POST",
+          "Uri": {
+            "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${APIHandler68F11976.Arn}/response-streaming-invocations"
+          },
+          "Credentials": {
+            "Fn::GetAtt": ["ApiGatewayLambdaRole", "Arn"]
+          },
+          "ResponseTransferMode": "STREAM",
+          "TimeoutInMillis": 900000
+        }
+      },
+      "Metadata": {
+        "aws:cdk:path": "SwiftChatAPILambda/SwiftChatApi/RootMethod"
+      }
+    },
+    "SwiftChatApiProxyMethod": {
+      "Type": "AWS::ApiGateway::Method",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "SwiftChatApi"
+        },
+        "ResourceId": {
+          "Ref": "SwiftChatApiProxyResource"
+        },
+        "HttpMethod": "ANY",
+        "AuthorizationType": "NONE",
+        "ApiKeyRequired": true,
+        "Integration": {
+          "Type": "AWS_PROXY",
+          "IntegrationHttpMethod": "POST",
+          "Uri": {
+            "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${APIHandler68F11976.Arn}/response-streaming-invocations"
+          },
+          "Credentials": {
+            "Fn::GetAtt": ["ApiGatewayLambdaRole", "Arn"]
+          },
+          "ResponseTransferMode": "STREAM",
+          "TimeoutInMillis": 900000
+        }
+      },
+      "Metadata": {
+        "aws:cdk:path": "SwiftChatAPILambda/SwiftChatApi/ProxyMethod"
+      }
+    },
+    "SwiftChatApiDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "SwiftChatApi"
+        },
+        "Description": "SwiftChat API deployment"
+      },
+      "DependsOn": ["SwiftChatApiRootMethod", "SwiftChatApiProxyMethod"],
+      "Metadata": {
+        "aws:cdk:path": "SwiftChatAPILambda/SwiftChatApi/Deployment"
+      }
+    },
+    "SwiftChatApiStage": {
+      "Type": "AWS::ApiGateway::Stage",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "SwiftChatApi"
+        },
+        "DeploymentId": {
+          "Ref": "SwiftChatApiDeployment"
+        },
+        "StageName": "v1"
+      },
+      "Metadata": {
+        "aws:cdk:path": "SwiftChatAPILambda/SwiftChatApi/Stage"
+      }
+    },
+    "ApiGatewayLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "apigateway.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "InvokeLambdaWithStream",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "lambda:InvokeFunction",
+                    "lambda:InvokeFunctionWithResponseStream"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": ["APIHandler68F11976", "Arn"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "Metadata": {
+        "aws:cdk:path": "SwiftChatAPILambda/ApiGatewayLambdaRole"
+      }
+    },
+    "SwiftChatApiKey": {
+      "Type": "AWS::ApiGateway::ApiKey",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-api-key"
+        },
+        "Description": "API Key for SwiftChat API",
+        "Enabled": true,
+        "StageKeys": [
+          {
+            "RestApiId": {
+              "Ref": "SwiftChatApi"
+            },
+            "StageName": "v1"
+          }
+        ]
+      },
+      "DependsOn": ["SwiftChatApiStage"]
+    },
+    "SwiftChatUsagePlan": {
+      "Type": "AWS::ApiGateway::UsagePlan",
+      "Properties": {
+        "UsagePlanName": {
+          "Fn::Sub": "SwiftChatUsagePlan-${AWS::StackName}"
+        },
+        "Description": "Usage plan for SwiftChat API",
+        "ApiStages": [
+          {
+            "ApiId": {
+              "Ref": "SwiftChatApi"
+            },
+            "Stage": "v1"
+          }
+        ]
+      },
+      "DependsOn": ["SwiftChatApiStage"]
+    },
+    "SwiftChatUsagePlanKey": {
+      "Type": "AWS::ApiGateway::UsagePlanKey",
+      "Properties": {
+        "KeyId": {
+          "Ref": "SwiftChatApiKey"
+        },
+        "KeyType": "API_KEY",
+        "UsagePlanId": {
+          "Ref": "SwiftChatUsagePlan"
+        }
+      }
+    },
+    "SwiftChatCloudFront": {
+      "Type": "AWS::CloudFront::Distribution",
+      "DependsOn": ["SwiftChatApiStage"],
+      "Properties": {
+        "DistributionConfig": {
+          "Enabled": true,
+          "Comment": "CloudFront in front of SwiftChat API Gateway (streaming, caching disabled)",
+          "HttpVersion": "http2",
+          "IPV6Enabled": true,
+          "Origins": [
+            {
+              "Id": "ApiGatewayOrigin",
+              "DomainName": {
+                "Fn::Sub": "${SwiftChatApi}.execute-api.${AWS::Region}.amazonaws.com"
+              },
+              "OriginPath": "/v1",
+              "CustomOriginConfig": {
+                "OriginProtocolPolicy": "https-only",
+                "OriginSSLProtocols": ["TLSv1.2"],
+                "OriginReadTimeout": 60,
+                "OriginKeepaliveTimeout": 60
+              }
+            }
+          ],
+          "DefaultCacheBehavior": {
+            "TargetOriginId": "ApiGatewayOrigin",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": [
+              "GET",
+              "HEAD",
+              "OPTIONS",
+              "PUT",
+              "POST",
+              "PATCH",
+              "DELETE"
+            ],
+            "Compress": false,
+            "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+            "OriginRequestPolicyId": "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+          }
+        }
       }
     },
     "CDKMetadata": {
@@ -255,12 +439,21 @@
   },
   "Outputs": {
     "APIURL": {
-      "Description": "API URL for SwiftChat App",
+      "Description": "API URL for SwiftChat App (CloudFront in front of API Gateway)",
       "Value": {
-        "Fn::GetAtt": [
-          "APIHandlerFunctionUrlD2500C9A",
-          "FunctionUrl"
-        ]
+        "Fn::Sub": "https://${SwiftChatCloudFront.DomainName}"
+      }
+    },
+    "ApiKeyId": {
+      "Description": "API Key ID (use with `aws apigateway get-api-key --include-value` to retrieve the key value)",
+      "Value": {
+        "Ref": "SwiftChatApiKey"
+      }
+    },
+    "ApiKeyConsole": {
+      "Description": "Open this URL to get your API Key, find and copy the key named <StackName>-api-key",
+      "Value": {
+        "Fn::Sub": "https://console.aws.amazon.com/apigateway/main/api-keys"
       }
     }
   },

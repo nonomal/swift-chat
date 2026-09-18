@@ -4,7 +4,6 @@ import {
   Image,
   Linking,
   Platform,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Switch,
@@ -12,8 +11,11 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import Dialog from 'react-native-dialog';
+import RNFS from 'react-native-fs';
 import { NavigationProp, useNavigation } from '@react-navigation/native';
-import { setHapticFeedbackEnabled, trigger } from '../chat/util/HapticUtils.ts';
+import { setHapticFeedbackEnabled, trigger } from '../core/HapticUtils';
 import { HapticFeedbackTypes } from 'react-native-haptic-feedback/src';
 import {
   getAllImageSize,
@@ -27,11 +29,12 @@ import {
   getModelUsage,
   getOllamaApiUrl,
   getOllamaApiKey,
-  getOpenAIApiKey,
   getOpenAIProxyEnabled,
   getRegion,
   getTextModel,
   getThinkingEnabled,
+  getReasoningEffort,
+  saveReasoningEffort,
   getVoiceId,
   isNewStabilityImageModel,
   saveAllModels,
@@ -41,7 +44,6 @@ import {
   saveKeys,
   saveOllamaApiURL,
   saveOllamaApiKey,
-  saveOpenAIApiKey,
   saveOpenAIProxyEnabled,
   saveRegion,
   saveTextModel,
@@ -54,6 +56,9 @@ import {
   saveBedrockApiKey,
   generateOpenAICompatModels,
   getOpenAICompatConfigs,
+  getTavilyApiKey,
+  saveTavilyApiKey,
+  clearAllChatHistory,
 } from '../storage/StorageUtils.ts';
 import { CustomHeaderRightButton } from '../chat/component/CustomHeaderRightButton.tsx';
 import { RouteParamList } from '../types/RouteTypes.ts';
@@ -68,6 +73,7 @@ import {
 
 import packageJson from '../../package.json';
 import { isMac } from '../App.tsx';
+import { getBuildNumber } from '../utils/PlatformUtils.ts';
 import CustomDropdown from './DropdownComponent.tsx';
 import {
   addBedrockPrefixToDeepseekModels,
@@ -76,17 +82,20 @@ import {
 import {
   BedrockThinkingModels,
   BedrockVoiceModels,
+  DeepSeekThinkingModels,
   DefaultTextModel,
   getAllRegions,
   getDefaultApiKeyModels,
+  LiteRTModels,
   VoiceIDList,
 } from '../storage/Constants.ts';
 import CustomTextInput from './CustomTextInput.tsx';
-import { requestAllOllamaModels } from '../api/ollama-api.ts';
+import ScanQRSheet, { ScanQRSheetRef } from './ScanQRSheet.tsx';
+import { requestAllOllamaModels } from '../api/providers/ollama-api.ts';
 import TabButton from './TabButton';
 import { useAppContext } from '../history/AppProvider.tsx';
 import { useTheme, ColorScheme } from '../theme';
-import { requestAllModelsByBedrockAPI } from '../api/bedrock-api-key.ts';
+import { requestAllModelsByBedrockAPI } from '../api/providers/bedrock-api-key.ts';
 import OpenAICompatConfigsSection from './OpenAICompatConfigsSection.tsx';
 
 const initUpgradeInfo: UpgradeInfo = {
@@ -95,7 +104,8 @@ const initUpgradeInfo: UpgradeInfo = {
   url: '',
 };
 
-export const GITHUB_LINK = 'https://github.com/aws-samples/swift-chat';
+export const GITHUB_LINK =
+  'https://github.com/aws-samples/sample-mobile-ai-assistant';
 
 function SettingsScreen(): React.JSX.Element {
   const { colors, isDark } = useTheme();
@@ -105,7 +115,6 @@ function SettingsScreen(): React.JSX.Element {
   const [ollamaApiUrl, setOllamaApiUrl] = useState(getOllamaApiUrl);
   const [ollamaApiKey, setOllamaApiKey] = useState(getOllamaApiKey);
   const [deepSeekApiKey, setDeepSeekApiKey] = useState(getDeepSeekApiKey);
-  const [openAIApiKey, setOpenAIApiKey] = useState(getOpenAIApiKey);
   const [openAIProxyEnabled, setOpenAIProxyEnabled] = useState(
     getOpenAIProxyEnabled
   );
@@ -128,13 +137,21 @@ function SettingsScreen(): React.JSX.Element {
   const controllerRef = useRef<AbortController | null>(null);
   const [selectedTab, setSelectedTab] = useState('bedrock');
   const [thinkingEnabled, setThinkingEnabled] = useState(getThinkingEnabled);
+  const [reasoningEffort, setReasoningEffort] = useState(getReasoningEffort);
   const [voiceId, setVoiceId] = useState(getVoiceId);
   const [bedrockConfigMode, setBedrockConfigMode] =
     useState(getBedrockConfigMode);
   const [bedrockApiKey, setBedrockApiKey] = useState(getBedrockApiKey);
+  const [tavilyApiKey, setTavilyApiKey] = useState(getTavilyApiKey);
   const { sendEvent } = useAppContext();
   const sendEventRef = useRef(sendEvent);
   const openAICompatConfigsRef = useRef(openAICompatConfigs);
+  const bedrockConfigModeRef = useRef(bedrockConfigMode);
+  const [showClearDialog, setShowClearDialog] = useState(false);
+  const [clearCountdown, setClearCountdown] = useState(10);
+  const [isClearing, setIsClearing] = useState(false);
+  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const scanSheetRef = useRef<ScanQRSheetRef>(null);
 
   // Handle OpenAI Compatible configs change
   const handleOpenAICompatConfigsChange = useCallback(
@@ -166,7 +183,7 @@ function SettingsScreen(): React.JSX.Element {
       };
       if (shouldFetchBedrock) {
         bedrockResponse =
-          bedrockConfigMode === 'bedrock'
+          bedrockConfigModeRef.current === 'bedrock'
             ? await requestAllModelsByBedrockAPI()
             : await requestAllModels();
         addBedrockPrefixToDeepseekModels(bedrockResponse.textModel);
@@ -212,12 +229,14 @@ function SettingsScreen(): React.JSX.Element {
               ...ollamaModels,
               ...getDefaultApiKeyModels(),
               ...openAICompatModelList,
+              ...LiteRTModels,
             ]
           : [
               ...bedrockResponse.textModel,
               ...ollamaModels,
               ...getDefaultApiKeyModels(),
               ...openAICompatModelList,
+              ...LiteRTModels,
             ];
 
       setTextModels(allTextModels);
@@ -250,7 +269,7 @@ function SettingsScreen(): React.JSX.Element {
         });
       }
     },
-    [bedrockConfigMode, textModels, imageModels]
+    [textModels, imageModels]
   );
 
   const fetchAndSetModelNamesRef = useRef(fetchAndSetModelNames);
@@ -312,14 +331,6 @@ function SettingsScreen(): React.JSX.Element {
   }, [deepSeekApiKey]);
 
   useEffect(() => {
-    if (openAIApiKey === getOpenAIApiKey()) {
-      return;
-    }
-    saveOpenAIApiKey(openAIApiKey.trim());
-    fetchAndSetModelNamesRef.current(false, false).then();
-  }, [openAIApiKey]);
-
-  useEffect(() => {
     const currentConfigs = openAICompatConfigsRef.current;
     if (
       JSON.stringify(openAICompatConfigs) === JSON.stringify(currentConfigs)
@@ -331,6 +342,7 @@ function SettingsScreen(): React.JSX.Element {
   }, [openAICompatConfigs]);
 
   useEffect(() => {
+    bedrockConfigModeRef.current = bedrockConfigMode;
     if (bedrockConfigMode === getBedrockConfigMode()) {
       return;
     }
@@ -384,7 +396,7 @@ function SettingsScreen(): React.JSX.Element {
   }));
   const textModelsData: DropdownItem[] = textModels.map(model => ({
     label: model.modelName ?? '',
-    value: model.modelId ?? '',
+    value: model.modelName ?? '',
   }));
   const imageModelsData: DropdownItem[] = imageModels.map(model => ({
     label: model.modelName ?? '',
@@ -409,6 +421,74 @@ function SettingsScreen(): React.JSX.Element {
   const toggleThinking = (value: boolean) => {
     setThinkingEnabled(value);
     saveThinkingEnabled(value);
+  };
+
+  const handleOpenClearDialog = () => {
+    setShowClearDialog(true);
+    setClearCountdown(10);
+    countdownIntervalRef.current = setInterval(() => {
+      setClearCountdown(prev => {
+        if (prev <= 1) {
+          if (countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+          }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const handleCloseClearDialog = () => {
+    setShowClearDialog(false);
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setClearCountdown(10);
+  };
+
+  const handleClearAllData = async () => {
+    if (clearCountdown > 0) {
+      return;
+    }
+    setIsClearing(true);
+    try {
+      // Clear all chat history from storage
+      clearAllChatHistory();
+
+      // Delete all files in DocumentDirectoryPath
+      const documentPath = RNFS.DocumentDirectoryPath;
+      const files = await RNFS.readDir(documentPath);
+      for (const file of files) {
+        // Skip system files and directories that shouldn't be deleted
+        if (
+          file.name.startsWith('.') ||
+          file.name === 'mmkv' ||
+          file.name === 'RCTAsyncLocalStorage' ||
+          file.name === 'RCTAsyncLocalStorage_V1'
+        ) {
+          continue;
+        }
+        try {
+          if (file.isDirectory()) {
+            await RNFS.unlink(file.path);
+          } else {
+            await RNFS.unlink(file.path);
+          }
+        } catch (e) {
+          console.warn('Failed to delete file:', file.path, e);
+        }
+      }
+
+      sendEvent('historyChanged');
+      handleCloseClearDialog();
+    } catch (error) {
+      console.error('Error clearing data:', error);
+    } finally {
+      setIsClearing(false);
+    }
   };
 
   const renderProviderSettings = () => {
@@ -448,7 +528,7 @@ function SettingsScreen(): React.JSX.Element {
                     bedrockConfigMode === 'swiftchat' &&
                       styles.configSwitchTextActive,
                   ]}>
-                  SwiftChat Server
+                  App Server
                 </Text>
               </TouchableOpacity>
             </View>
@@ -469,6 +549,18 @@ function SettingsScreen(): React.JSX.Element {
                   value={apiUrl}
                   onChangeText={setApiUrl}
                   placeholder="Enter API URL"
+                  rightIcon={
+                    !isMac
+                      ? isDark
+                        ? require('../assets/scan_dark.png')
+                        : require('../assets/scan.png')
+                      : undefined
+                  }
+                  onRightIconPress={
+                    !isMac
+                      ? () => scanSheetRef.current?.present()
+                      : undefined
+                  }
                 />
                 <CustomTextInput
                   label="API Key"
@@ -525,13 +617,6 @@ function SettingsScreen(): React.JSX.Element {
       case 'openai':
         return (
           <>
-            <CustomTextInput
-              label="OpenAI API Key"
-              value={openAIApiKey}
-              onChangeText={setOpenAIApiKey}
-              placeholder="Enter OpenAI API Key"
-              secureTextEntry={true}
-            />
             <OpenAICompatConfigsSection
               isDark={isDark}
               onConfigsChange={handleOpenAICompatConfigsChange}
@@ -556,7 +641,7 @@ function SettingsScreen(): React.JSX.Element {
   const styles = createStyles(colors);
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <ScrollView style={styles.container}>
         <View style={styles.providerSettingsWrapper}>
           <View style={styles.tabContainer}>
@@ -591,11 +676,11 @@ function SettingsScreen(): React.JSX.Element {
         <CustomDropdown
           label="Chat Model"
           data={textModelsData}
-          value={selectedTextModel.modelId}
+          value={selectedTextModel.modelName}
           onChange={(item: DropdownItem) => {
             if (item.value !== '') {
               const selectedModel = textModels.find(
-                model => model.modelId === item.value
+                model => model.modelName === item.value
               );
               if (selectedModel) {
                 saveTextModel(selectedModel);
@@ -608,7 +693,9 @@ function SettingsScreen(): React.JSX.Element {
           placeholder="Select a model"
         />
         {selectedTextModel &&
-          BedrockThinkingModels.includes(selectedTextModel.modelName) && (
+          !selectedTextModel.modelId.includes('gpt-5.6') &&
+          (BedrockThinkingModels.includes(selectedTextModel.modelName) ||
+            DeepSeekThinkingModels.includes(selectedTextModel.modelName)) && (
             <View style={styles.thinkingSwitchContainer}>
               <Text style={styles.proxyLabel}>Enable Thinking</Text>
               <Switch
@@ -617,6 +704,28 @@ function SettingsScreen(): React.JSX.Element {
                 onValueChange={toggleThinking}
               />
             </View>
+          )}
+        {selectedTextModel &&
+          selectedTextModel.modelId.includes('gpt-5.6') && (
+            <CustomDropdown
+              label="Reasoning Effort"
+              data={[
+                { label: 'None', value: 'none' },
+                { label: 'Low', value: 'low' },
+                { label: 'Medium', value: 'medium' },
+                { label: 'High', value: 'high' },
+                { label: 'X-High', value: 'xhigh' },
+                { label: 'Max', value: 'max' },
+              ]}
+              value={reasoningEffort}
+              onChange={(item: DropdownItem) => {
+                if (item.value !== '' && item.value !== reasoningEffort) {
+                  setReasoningEffort(item.value);
+                  saveReasoningEffort(item.value);
+                }
+              }}
+              placeholder="Select reasoning effort"
+            />
           )}
 
         {selectedTextModel &&
@@ -667,6 +776,19 @@ function SettingsScreen(): React.JSX.Element {
             }
           }}
           placeholder="Select image size"
+        />
+
+        <Text style={[styles.label, styles.middleLabel]}>Web Search</Text>
+
+        <CustomTextInput
+          label="Tavily API Key"
+          value={tavilyApiKey}
+          onChangeText={text => {
+            setTavilyApiKey(text);
+            saveTavilyApiKey(text);
+          }}
+          placeholder="Enter Tavily API Key"
+          secureTextEntry={true}
         />
         <TouchableOpacity
           activeOpacity={1}
@@ -743,16 +865,17 @@ function SettingsScreen(): React.JSX.Element {
           />
         </TouchableOpacity>
         <TouchableOpacity
-          style={styles.versionContainer}
+          style={styles.itemContainer}
           activeOpacity={1}
           onPress={handleCheckUpgrade}>
           <Text style={styles.label}>App Version</Text>
           <View style={styles.arrowContainer}>
             <Text style={styles.text}>
               {packageJson.version +
-                (upgradeInfo.needUpgrade
-                  ? ' (' + upgradeInfo.version + ')'
-                  : '')}
+                (Platform.OS === 'ios' && getBuildNumber()
+                  ? ` (${getBuildNumber()})`
+                  : '') +
+                (upgradeInfo.needUpgrade ? ` → ${upgradeInfo.version}` : '')}
             </Text>
             <Image
               style={styles.arrowImage}
@@ -764,7 +887,39 @@ function SettingsScreen(): React.JSX.Element {
             />
           </View>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.clearDataButton}
+          activeOpacity={0.7}
+          onPress={handleOpenClearDialog}>
+          <Text style={styles.clearDataButtonText}>Clear All Chat History</Text>
+        </TouchableOpacity>
       </ScrollView>
+      <Dialog.Container visible={showClearDialog}>
+        <Dialog.Title>Clear All Data</Dialog.Title>
+        <Dialog.Description>
+          This will delete all chat history and saved files. This action cannot
+          be undone.
+          {clearCountdown > 0
+            ? `\n\nPlease wait ${clearCountdown} seconds to confirm.`
+            : '\n\nYou can now confirm the deletion.'}
+        </Dialog.Description>
+        <Dialog.Button label="Cancel" onPress={handleCloseClearDialog} />
+        <Dialog.Button
+          label={isClearing ? 'Clearing...' : 'Confirm'}
+          onPress={handleClearAllData}
+          disabled={clearCountdown > 0 || isClearing}
+          color={clearCountdown > 0 ? '#999' : '#FF3B30'}
+        />
+      </Dialog.Container>
+      {!isMac && (
+        <ScanQRSheet
+          ref={scanSheetRef}
+          onScanned={({ apiUrl: scannedUrl, apiKey: scannedKey }) => {
+            setApiUrl(scannedUrl);
+            setApiKey(scannedKey);
+          }}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -854,6 +1009,20 @@ const createStyles = (colors: ColorScheme) =>
       justifyContent: 'space-between',
       marginVertical: 10,
       paddingBottom: 60,
+    },
+    clearDataButton: {
+      backgroundColor: '#F5F5F5',
+      borderRadius: 8,
+      paddingVertical: 14,
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginTop: 20,
+      marginBottom: 80,
+    },
+    clearDataButtonText: {
+      color: '#FF3B30',
+      fontSize: 16,
+      fontWeight: '600',
     },
     apiKeyContainer: {
       flexDirection: 'row',

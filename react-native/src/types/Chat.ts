@@ -1,5 +1,11 @@
-import { IMessage } from 'react-native-gifted-chat';
-import { User } from 'react-native-gifted-chat/lib/Models';
+import React from 'react';
+
+export interface Citation {
+  number: number; // 引用编号 [1], [2], [3]...
+  title: string; // 链接标题
+  url: string; // 链接地址
+  excerpt?: string; // 简介/摘要
+}
 
 export type Chat = {
   id: number;
@@ -17,6 +23,15 @@ export enum ChatStatus {
 export interface EventData {
   id?: number;
   prompt?: SystemPrompt;
+  // WebView search events
+  url?: string;
+  script?: string;
+  data?: string;
+  error?: string;
+  code?: number;
+  // App mode events
+  htmlCode?: string;
+  diffCode?: string;
 }
 
 export type Model = {
@@ -26,6 +41,7 @@ export type Model = {
   uniqueId?: string;
   apiKey?: string;
   apiUrl?: string;
+  apiMode?: ApiMode;
 };
 
 export enum ModelTag {
@@ -34,6 +50,17 @@ export enum ModelTag {
   OpenAICompatible = 'OpenAICompatible',
   DeepSeek = 'DeepSeek',
   Ollama = 'Ollama',
+  LiteRT = 'LiteRT',
+}
+
+// Which Bedrock API a model is invoked through. Models served on the
+// bedrock-mantle engine use the OpenAI Responses / Anthropic Messages APIs;
+// everything else uses the legacy bedrock-runtime Converse API.
+export enum ApiMode {
+  Converse = 'Converse',
+  MantleResponses = 'MantleResponses',
+  MantleChatCompletions = 'MantleChatCompletions',
+  MantleMessages = 'MantleMessages',
 }
 
 export type OllamaModel = {
@@ -118,15 +145,42 @@ export type UsagePrice = {
   largeImagePrice: number;
 };
 
-export interface SwiftChatMessage extends IMessage {
-  usage?: Usage;
-  reasoning?: string;
-  user: SwiftChatUser;
-  metrics?: Metrics;
+export interface SwiftChatUser {
+  _id: string | number;
+  name?: string;
+  avatar?: string | number | (() => React.ReactNode);
+  modelTag?: string;
 }
 
-interface SwiftChatUser extends User {
-  modelTag?: string;
+export interface SwiftChatMessage {
+  _id: string | number;
+  text: string;
+  createdAt: Date | number;
+  user: SwiftChatUser;
+  image?: string;
+  video?: string;
+  audio?: string;
+  system?: boolean;
+  sent?: boolean;
+  received?: boolean;
+  pending?: boolean;
+  quickReplies?: {
+    type: 'radio' | 'checkbox';
+    values: Array<{
+      title: string;
+      value: string;
+      messageId?: string | number;
+    }>;
+    keepIt?: boolean;
+  };
+  // Swift Chat custom fields
+  usage?: Usage;
+  reasoning?: string;
+  metrics?: Metrics;
+  citations?: Citation[];
+  htmlCode?: string;
+  diffCode?: string;
+  isLastHtml?: boolean;
 }
 
 export interface SystemPrompt {
@@ -136,6 +190,7 @@ export interface SystemPrompt {
   includeHistory: boolean;
   promptType?: string; // 'image' 'voice' or undefined
   allowInterruption?: boolean;
+  isAgent?: boolean; // true => runs as on-device LiteRT tool-calling agent
 }
 
 export interface BedrockChunk {
@@ -177,4 +232,12 @@ export type TokenResponse = {
 export interface Metrics {
   latencyMs: string;
   speed: string;
+}
+
+export interface SavedApp {
+  id: string;
+  name: string;
+  htmlCode: string;
+  screenshotPath?: string;
+  createdAt: number;
 }

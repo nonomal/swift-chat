@@ -1,24 +1,35 @@
 import 'react-native-gesture-handler';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
 import * as React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import {
   createDrawerNavigator,
   DrawerContentComponentProps,
 } from '@react-navigation/drawer';
+import { Header } from '@react-navigation/elements';
 import CustomDrawerContent from './history/CustomDrawerContent.tsx';
-import { Dimensions, Keyboard, StatusBar } from 'react-native';
+import { Dimensions, Keyboard, StatusBar, StyleSheet } from 'react-native';
 import ChatScreen from './chat/ChatScreen.tsx';
 import { RouteParamList } from './types/RouteTypes.ts';
 import { AppProvider, useAppContext } from './history/AppProvider.tsx';
 import SettingsScreen from './settings/SettingsScreen.tsx';
 import Toast from 'react-native-toast-message';
 import TokenUsageScreen from './settings/TokenUsageScreen.tsx';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { createNativeStackNavigator, NativeStackHeaderProps } from '@react-navigation/native-stack';
 import PromptScreen from './prompt/PromptScreen.tsx';
+import AppGalleryScreen from './appgen/screens/AppGalleryScreen.tsx';
+import AppViewerScreen from './appgen/screens/AppViewerScreen.tsx';
+import CreateAppScreen from './appgen/screens/CreateAppScreen.tsx';
+import ImageGalleryScreen from './imagegen/ImageGalleryScreen.tsx';
 import { isAndroid, isMacCatalyst } from './utils/PlatformUtils';
 import { ThemeProvider, useTheme } from './theme';
 import { configureErrorHandling } from './utils/ErrorUtils';
 import { migrateOpenAICompatConfig } from './storage/StorageUtils.ts';
+import { liteRTService } from './chat/service/LiteRTService.ts';
+import { SearchWebView } from './websearch/components/SearchWebView';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+import { HeaderLeftView } from './prompt/HeaderLeftView.tsx';
 
 export const isMac = isMacCatalyst;
 const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
@@ -54,50 +65,82 @@ const DrawerNavigator = () => {
           borderBottomWidth: isDark ? 0.3 : undefined,
           borderBottomColor: isDark ? colors.chatScreenSplit : undefined,
         },
+        headerStatusBarHeight: isMac ? 20 : undefined,
         drawerType: isMac ? drawerType : 'slide',
       }}
       drawerContent={renderCustomDrawerContent}>
       <Drawer.Screen name="Bedrock" component={ChatScreen} />
       <Drawer.Screen name="Settings" component={SettingsScreen} />
+      <Drawer.Screen name="ImageGallery" component={ImageGalleryScreen} />
+      <Drawer.Screen name="AppGallery" component={AppGalleryScreen} />
     </Drawer.Navigator>
   );
 };
+const macHeaderStyle = StyleSheet.create({
+  leftContainer: { paddingLeft: 6 },
+  rightContainer: { paddingRight: 6 },
+});
+const MacStackHeader = ({ navigation, options }: NativeStackHeaderProps) => {
+  const { isDark, colors } = useTheme();
+  const headerStyle = StyleSheet.flatten([
+    { backgroundColor: colors.background, height: 66 },
+    options.headerStyle,
+  ]);
+  return (
+    <Header
+      title={options.title ?? ''}
+      headerLeft={options.headerLeft ?? (() => HeaderLeftView(navigation, isDark))}
+      headerRight={options.headerRight}
+      headerStyle={headerStyle}
+      headerLeftContainerStyle={macHeaderStyle.leftContainer}
+      headerRightContainerStyle={macHeaderStyle.rightContainer}
+      headerTintColor={options.headerTintColor}
+      headerTitleAlign="center"
+      headerStatusBarHeight={20}
+    />
+  );
+};
+
 const AppNavigator = () => {
   const { colors } = useTheme();
   return (
-    <Stack.Navigator initialRouteName="Drawer" screenOptions={{}}>
+    <Stack.Navigator initialRouteName="Drawer" screenOptions={{
+      contentStyle: isMac ? { backgroundColor: colors.background } : undefined,
+      header: isMac ? MacStackHeader : undefined,
+      headerTitleAlign: 'center',
+      headerStyle: { backgroundColor: colors.background },
+      headerTintColor: colors.text,
+    }}>
       <Stack.Screen
         name="Drawer"
         component={DrawerNavigator}
-        options={{ headerShown: false, headerLargeTitleShadowVisible: false }}
+        options={{ headerShown: false }}
       />
       <Stack.Screen
         name="TokenUsage"
         component={TokenUsageScreen}
-        options={{
-          title: 'Usage',
-          contentStyle: {
-            height: isMac ? 66 : undefined,
-            backgroundColor: colors.background,
-          },
-          headerTitleAlign: 'center',
-          headerStyle: { backgroundColor: colors.background },
-          headerTintColor: colors.text,
-        }}
+        options={{ title: 'Usage' }}
       />
       <Stack.Screen
         name="Prompt"
         component={PromptScreen}
-        options={{
-          title: 'System Prompt',
-          contentStyle: {
-            height: isMac ? 66 : undefined,
-            backgroundColor: colors.background,
-          },
-          headerTitleAlign: 'center',
-          headerStyle: { backgroundColor: colors.background },
-          headerTintColor: colors.text,
+        options={{ title: 'System Prompt' }}
+      />
+      <Stack.Screen
+        name="AppViewer"
+        component={AppViewerScreen}
+        options={({ route }) => {
+          const params = route.params as RouteParamList['AppViewer'];
+          return {
+            title: params?.app?.name ?? 'App',
+            contentStyle: { backgroundColor: '#000000' },
+          };
         }}
+      />
+      <Stack.Screen
+        name="CreateApp"
+        component={CreateAppScreen}
+        options={{ title: 'Create App' }}
       />
     </Stack.Navigator>
   );
@@ -110,6 +153,7 @@ const AppWithTheme = () => {
       <StatusBar
         barStyle={isDark ? 'light-content' : 'dark-content'}
         backgroundColor={colors.background}
+        translucent={isAndroid}
       />
       <NavigationContainer
         onStateChange={_ => {
@@ -117,6 +161,9 @@ const AppWithTheme = () => {
         }}>
         <AppNavigator />
       </NavigationContainer>
+
+      {/* WebView用于web search */}
+      <SearchWebView />
     </>
   );
 };
@@ -125,18 +172,30 @@ const App = () => {
   React.useEffect(() => {
     configureErrorHandling();
     migrateOpenAICompatConfig();
+    liteRTService.syncModelReadyFlag();
   }, []);
 
+  // On Mac, we don't need KeyboardProvider
+  const content = (
+    <ThemeProvider>
+      <AppProvider>
+        <AppWithTheme />
+      </AppProvider>
+    </ThemeProvider>
+  );
+
   return (
-    <>
-      <ThemeProvider>
-        <AppProvider>
-          <AppWithTheme />
-        </AppProvider>
-      </ThemeProvider>
-      <Toast />
-    </>
+    <GestureHandlerRootView style={styles.root}>
+      <BottomSheetModalProvider>
+        {isMac ? content : <KeyboardProvider>{content}</KeyboardProvider>}
+        <Toast />
+      </BottomSheetModalProvider>
+    </GestureHandlerRootView>
   );
 };
+
+const styles = StyleSheet.create({
+  root: { flex: 1 },
+});
 
 export default App;

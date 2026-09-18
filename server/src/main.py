@@ -1,7 +1,7 @@
 import base64
 from typing import List
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, Request as FastAPIRequest
+from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse, PlainTextResponse
 import boto3
 import json
@@ -9,17 +9,13 @@ import random
 import os
 import re
 from pydantic import BaseModel
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Annotated
-from urllib.request import urlopen, Request
 import time
 from image_nl_processor import get_native_request_with_ref_image, get_analyse_result, get_native_request_with_virtual_try_on
 import httpx
+from mantle import get_mantle_base_url, sign_mantle_request
 
 app = FastAPI()
-security = HTTPBearer()
 
-auth_token = ''
 CACHE_DURATION = 120000
 cache = {
     "latest_version": "",
@@ -59,6 +55,14 @@ class ModelsRequest(BaseModel):
     region: str
 
 
+# bedrock-mantle requests are proxied verbatim: the client builds the OpenAI
+# Responses / Anthropic Messages body, we sign it with the server IAM role and
+# stream the response straight back.
+class MantleRequest(BaseModel):
+    region: str
+    body: dict
+
+
 class TokenRequest(BaseModel):
     region: str
 
@@ -68,33 +72,39 @@ class UpgradeRequest(BaseModel):
     version: str
 
 
-def get_api_key_from_ssm(use_cache_token: bool):
-    global auth_token
-    if use_cache_token and auth_token != '':
-        return auth_token
-    ssm_client = boto3.client('ssm')
-    api_key_name = os.environ['API_KEY_NAME']
-    try:
-        response = ssm_client.get_parameter(
-            Name=api_key_name,
-            WithDecryption=True
-        )
-        auth_token = response['Parameter']['Value']
-        return auth_token
-    except Exception as error:
-        raise HTTPException(status_code=401,
-                            detail=f"Error: Please create your API Key in Parameter Store, {str(error)}")
+# Claude requires max_tokens on Converse; omitting it truncates at 4096.
+# Other families default to their server-side max, so None leaves them alone.
+def _resolve_max_tokens(model_id: str) -> int | None:
+    mid = model_id.lower()
+    if "anthropic" in mid or "claude" in mid:
+        if "claude-opus-4-7" in mid or "claude-opus-4-6" in mid:
+            return 128000
+        if (
+            "claude-opus-4-5" in mid
+            or "claude-sonnet-4" in mid
+            or "claude-3-7-sonnet" in mid
+            or "claude-haiku-4-5" in mid
+        ):
+            return 64000
+        if "claude-opus-4" in mid:
+            return 32000
+        if "claude-3-5" in mid:
+            return 8192
+        return 4096
+    if "nova-premier" in mid:
+        return 25000
+    return None
 
 
-def verify_api_key(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
-                   use_cache_token: bool = True):
-    if credentials.credentials != get_api_key_from_ssm(use_cache_token):
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    return credentials.credentials
-
-
-def verify_and_refresh_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
-    return verify_api_key(credentials, use_cache_token=False)
+# Sonnet >= 4 and Opus >= 4.5 accept the 1M input-context beta.
+def _supports_1m_context(model_id: str) -> bool:
+    mid = model_id.lower()
+    if "claude-sonnet-4" in mid:
+        return True
+    return any(
+        v in mid
+        for v in ("claude-opus-4-5", "claude-opus-4-6", "claude-opus-4-7")
+    )
 
 
 async def create_bedrock_command(request: ConverseRequest) -> tuple[boto3.client, dict]:
@@ -102,14 +112,6 @@ async def create_bedrock_command(request: ConverseRequest) -> tuple[boto3.client
     region = request.region
 
     client = boto3.client("bedrock-runtime", region_name=region)
-
-    max_tokens = 4096
-    if model_id.startswith('meta.llama'):
-        max_tokens = 2048
-    if 'deepseek.r1' in model_id or 'claude-opus-4' in model_id:
-        max_tokens = 32000
-    if 'claude-3-7-sonnet' in model_id or 'claude-sonnet-4' in model_id:
-        max_tokens = 64000
 
     for message in request.messages:
         if message["role"] == "user":
@@ -125,18 +127,21 @@ async def create_bedrock_command(request: ConverseRequest) -> tuple[boto3.client
                     content['document']['source']['bytes'] = document_bytes
 
     command = {
-        "inferenceConfig": {"maxTokens": max_tokens},
         "messages": request.messages,
         "modelId": model_id
     }
 
+    max_tokens = _resolve_max_tokens(model_id)
+    if max_tokens is not None:
+        command["inferenceConfig"] = {"maxTokens": max_tokens}
+
+    extra: dict = {}
     if request.enableThinking:
-        command['additionalModelRequestFields'] = {
-            "reasoning_config": {
-                "type": "enabled",
-                "budget_tokens": 16000
-            }
-        }
+        extra["reasoning_config"] = {"type": "enabled", "budget_tokens": 16000}
+    if _supports_1m_context(model_id):
+        extra["anthropic_beta"] = ["context-1m-2025-08-07"]
+    if extra:
+        command["additionalModelRequestFields"] = extra
 
     if request.system is not None:
         command["system"] = request.system
@@ -145,8 +150,7 @@ async def create_bedrock_command(request: ConverseRequest) -> tuple[boto3.client
 
 
 @app.post("/api/converse/v3")
-async def converse_v3(request: ConverseRequest,
-                      _: Annotated[str, Depends(verify_api_key)]):
+async def converse_v3(request: ConverseRequest):
     try:
         client, command = await create_bedrock_command(request)
 
@@ -165,8 +169,7 @@ async def converse_v3(request: ConverseRequest,
 
 
 @app.post("/api/converse/v2")
-async def converse_v2(request: ConverseRequest,
-                      _: Annotated[str, Depends(verify_api_key)]):
+async def converse_v2(request: ConverseRequest):
     try:
         client, command = await create_bedrock_command(request)
 
@@ -185,8 +188,7 @@ async def converse_v2(request: ConverseRequest,
 
 
 @app.post("/api/image")
-async def gen_image(request: ImageRequest,
-                    _: Annotated[str, Depends(verify_api_key)]):
+async def gen_image(request: ImageRequest):
     model_id = request.modelId
     prompt = request.prompt
     ref_images = request.refImages
@@ -201,8 +203,7 @@ async def gen_image(request: ImageRequest,
 
 
 @app.post("/api/token")
-async def get_token(request: TokenRequest,
-                    _: Annotated[str, Depends(verify_api_key)]):
+async def get_token(request: TokenRequest):
     region = request.region
     try:
         client_role_arn = os.environ.get('CLIENT_ROLE_ARN')
@@ -228,8 +229,7 @@ async def get_token(request: TokenRequest,
 
 
 @app.post("/api/models")
-async def get_models(request: ModelsRequest,
-                     _: Annotated[str, Depends(verify_api_key)]):
+async def get_models(request: ModelsRequest):
     region = request.region
     client = boto3.client("bedrock",
                           region_name=region)
@@ -242,7 +242,8 @@ async def get_models(request: ModelsRequest,
             image_model = []
             for model in response["modelSummaries"]:
                 need_cross_region = "INFERENCE_PROFILE" in model["inferenceTypesSupported"]
-                if (model["modelLifecycle"]["status"] == "ACTIVE"
+                if ((model["modelLifecycle"]["status"] == "ACTIVE"
+                     or model["modelId"] == "amazon.nova-canvas-v1:0")
                         and ("ON_DEMAND" in model["inferenceTypesSupported"] or need_cross_region)
                         and not model["modelId"].endswith("k")
                         and model["modelName"] not in model_names):
@@ -273,9 +274,64 @@ async def get_models(request: ModelsRequest,
         return {"error": str(e)}
 
 
+@app.post("/api/mantle/models")
+async def mantle_models(request: ModelsRequest):
+    region = request.region
+    url = get_mantle_base_url(region) + "/v1/models"
+    headers = sign_mantle_request("GET", url, region)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, timeout=8)
+            return response.json()
+    except Exception as e:
+        print(f"mantle models error: {e}")
+        return {"error": str(e)}
+
+
+@app.post("/api/mantle/responses")
+async def mantle_responses(request: MantleRequest):
+    return await _mantle_stream(request, "/openai/v1/responses")
+
+
+@app.post("/api/mantle/chat")
+async def mantle_chat(request: MantleRequest):
+    return await _mantle_stream(request, "/openai/v1/chat/completions")
+
+
+@app.post("/api/mantle/messages")
+async def mantle_messages(request: MantleRequest):
+    return await _mantle_stream(
+        request,
+        "/anthropic/v1/messages",
+        extra_headers={"anthropic-version": "2023-06-01"},
+    )
+
+
+async def _mantle_stream(request: MantleRequest, path: str, extra_headers: dict | None = None):
+    region = request.region
+    url = get_mantle_base_url(region) + path
+    body = json.dumps(request.body)
+    headers = sign_mantle_request("POST", url, region, body=body, extra_headers=extra_headers)
+    headers["Accept"] = "text/event-stream"
+
+    async def event_generator():
+        async with httpx.AsyncClient() as client:
+            try:
+                async with client.stream(
+                    "POST", url, content=body, headers=headers, timeout=None
+                ) as response:
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            yield chunk
+            except Exception as err:
+                print("mantle stream error:", err)
+                yield f"Error: {str(err)}".encode("utf-8")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.post("/api/upgrade")
-async def upgrade(request: UpgradeRequest,
-                  _: Annotated[str, Depends(verify_and_refresh_token)]):
+async def upgrade(request: UpgradeRequest):
     new_version = get_latest_version()
     total_number = calculate_version_total(request.version)
     need_upgrade = False
@@ -283,11 +339,11 @@ async def upgrade(request: UpgradeRequest,
     if total_number > 0:
         need_upgrade = total_number < calculate_version_total(new_version)
         if need_upgrade:
-            download_prefix = "https://github.com/aws-samples/swift-chat/releases/download/"
+            download_prefix = "https://github.com/aws-samples/sample-mobile-ai-assistant/releases/download/"
             if request.os == 'android':
-                url = download_prefix + new_version + "/SwiftChat.apk"
+                url = download_prefix + new_version + "/AIAssistant.apk"
             elif request.os == 'mac':
-                url = download_prefix + new_version + "/SwiftChat.dmg"
+                url = download_prefix + new_version + "/AIAssistant.dmg"
     return {"needUpgrade": need_upgrade, "version": new_version, "url": url}
 
 
@@ -341,19 +397,16 @@ def get_latest_version() -> str:
     timestamp = int(time.time() * 1000)
     if cache["last_check"] > 0 and timestamp - cache["last_check"] < CACHE_DURATION:
         return cache["latest_version"]
-    req = Request(
-        f"https://api.github.com/repos/aws-samples/swift-chat/tags",
-        headers={
-            'User-Agent': 'Mozilla/5.0'
-        }
-    )
     try:
-        with urlopen(req) as response:
-            content = response.read().decode('utf-8')
-            latest_version = json.loads(content)[0]['name']
-            cache["latest_version"] = latest_version
-            cache["last_check"] = timestamp
-            return json.loads(content)[0]['name']
+        response = httpx.get(
+            "https://api.github.com/repos/aws-samples/sample-mobile-ai-assistant/tags",
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        content = response.json()
+        latest_version = content[0]['name']
+        cache["latest_version"] = latest_version
+        cache["last_check"] = timestamp
+        return latest_version
     except Exception as error:
         print(f"Error occurred when get github tag: {error}")
     return '0.0.0'
@@ -361,7 +414,7 @@ def get_latest_version() -> str:
 
 def get_image(client, model_id, prompt, ref_image, width, height):
     try:
-        seed = random.randint(0, 2147483647)
+        seed = random.randint(0, 2147483647)  # nosec B311
         native_request = {}
         if model_id.startswith("amazon"):
             if ref_image is None:
@@ -417,4 +470,4 @@ def contains_chinese(text):
 
 if __name__ == "__main__":
     print("Starting webserver...")
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))  # nosec B104

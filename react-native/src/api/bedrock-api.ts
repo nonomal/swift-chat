@@ -15,10 +15,8 @@ import {
   getApiUrl,
   getBedrockApiKey,
   getBedrockConfigMode,
-  getDeepSeekApiKey,
   getImageModel,
   getImageSize,
-  getOpenAIApiKey,
   getRegion,
   getTextModel,
   getThinkingEnabled,
@@ -30,22 +28,24 @@ import {
   ImageContent,
   ImageInfo,
   TextContent,
-} from '../chat/util/BedrockMessageConvertor.ts';
-import { invokeOpenAIWithCallBack } from './open-api.ts';
-import { invokeOllamaWithCallBack } from './ollama-api.ts';
+} from './BedrockMessageConvertor.ts';
 import { BedrockThinkingModels } from '../storage/Constants.ts';
-import { getModelTag } from '../utils/ModelUtils.ts';
-import { invokeBedrockWithAPIKey, sleep } from './bedrock-api-key.ts';
-import { genImageWithAPIKey } from './bedrock-api-key-image.ts';
+import { genImageWithAPIKey } from './providers/bedrock-api-key-image.ts';
+import {
+  buildMantleOnlyModels,
+  tagModelsWithApiMode,
+} from './providers/mantle-utils.ts';
+import type { ChatCallbackFunction } from './types.ts';
+import { invokeChatProvider } from './ChatProviderRouter.ts';
 
-type CallbackFunction = (
-  result: string,
-  complete: boolean,
-  needStop: boolean,
-  usage?: Usage,
-  reasoning?: string
-) => void;
+type CallbackFunction = ChatCallbackFunction;
 export const isDev = false;
+
+/**
+ * Main entry point for chat invocations (text + image).
+ * For text mode, delegates to ChatProviderRouter.
+ * For image mode, handles image generation directly.
+ */
 export const invokeBedrockWithCallBack = async (
   messages: BedrockMessage[],
   chatMode: ChatMode,
@@ -54,206 +54,18 @@ export const invokeBedrockWithCallBack = async (
   controller: AbortController,
   callback: CallbackFunction
 ) => {
-  const currentModelTag = getModelTag(getTextModel());
-  if (chatMode === ChatMode.Text && currentModelTag !== ModelTag.Bedrock) {
-    if (
-      currentModelTag === ModelTag.DeepSeek &&
-      getDeepSeekApiKey().length === 0
-    ) {
-      callback('Please configure your DeepSeek API Key', true, false);
-      return;
-    }
-    if (currentModelTag === ModelTag.OpenAI && getOpenAIApiKey().length === 0) {
-      callback('Please configure your OpenAI API Key', true, false);
-      return;
-    }
-    if (
-      currentModelTag === ModelTag.OpenAICompatible &&
-      getTextModel().apiUrl!.length === 0
-    ) {
-      callback('Please configure your OpenAI Compatible API URL', true, false);
-      return;
-    }
-    if (currentModelTag === ModelTag.Ollama) {
-      await invokeOllamaWithCallBack(
-        messages,
-        prompt,
-        shouldStop,
-        controller,
-        callback
-      );
-    } else {
-      await invokeOpenAIWithCallBack(
-        messages,
-        prompt,
-        shouldStop,
-        controller,
-        callback
-      );
-    }
+  if (chatMode === ChatMode.Text) {
+    await invokeChatProvider(messages, prompt, shouldStop, controller, callback);
     return;
   }
+  // Image mode
   const bedrockConfigMode = getBedrockConfigMode();
   const bedrockApiKey = getBedrockApiKey();
   if (bedrockConfigMode === 'bedrock' && !bedrockApiKey) {
     callback('Please configure your Bedrock API Key', true, false);
     return;
   }
-  if (chatMode === ChatMode.Text) {
-    if (bedrockConfigMode === 'bedrock') {
-      await invokeBedrockWithAPIKey(
-        messages,
-        prompt,
-        shouldStop,
-        controller,
-        callback
-      );
-      return;
-    }
-    if (!isConfigured()) {
-      callback(
-        'Please configure your SwiftChat Server API URL and API Key',
-        true,
-        false
-      );
-      return;
-    }
-    const bodyObject = {
-      messages: messages,
-      modelId: getTextModel().modelId,
-      region: getRegion(),
-      enableThinking: isEnableThinking(),
-      system: prompt ? [{ text: prompt?.prompt }] : undefined,
-    };
-    if (prompt?.includeHistory === false) {
-      bodyObject.messages = messages.slice(-1);
-    }
-
-    const options = {
-      method: 'POST',
-      headers: {
-        accept: '*/*',
-        'content-type': 'application/json',
-        Authorization: 'Bearer ' + getApiKey(),
-      },
-      body: JSON.stringify(bodyObject),
-      signal: controller.signal,
-      reactNative: { textStreaming: true },
-    };
-    const url = getApiPrefix() + '/converse/v3';
-    let completeMessage = '';
-    let completeReasoning = '';
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
-    fetch(url!, options)
-      .then(response => {
-        return response.body;
-      })
-      .then(async body => {
-        clearTimeout(timeoutId);
-        if (!body) {
-          return;
-        }
-        const reader = body.getReader();
-        const decoder = new TextDecoder();
-        let appendTimes = 0;
-        while (true) {
-          if (shouldStop()) {
-            await reader.cancel();
-            if (completeMessage === '') {
-              completeMessage = '...';
-            }
-            callback(completeMessage, true, true, undefined, completeReasoning);
-            return;
-          }
-
-          try {
-            const { done, value } = await reader.read();
-            const chunk = decoder.decode(value, { stream: true });
-            if (chunk.length > 0) {
-              // Split by SSE event boundaries
-              const events = chunk.split('\n\n');
-              for (const event of events) {
-                await sleep(0.1);
-                const bedrockChunk = parseChunk(event);
-                if (bedrockChunk) {
-                  if (bedrockChunk.reasoning) {
-                    completeReasoning += bedrockChunk.reasoning ?? '';
-                    callback(
-                      completeMessage,
-                      false,
-                      false,
-                      undefined,
-                      completeReasoning
-                    );
-                  }
-                  if (bedrockChunk.text) {
-                    completeMessage += bedrockChunk.text ?? '';
-                    appendTimes++;
-                    if (appendTimes > 5000 && appendTimes % 2 === 0) {
-                      continue;
-                    }
-                    callback(
-                      completeMessage,
-                      false,
-                      false,
-                      undefined,
-                      completeReasoning
-                    );
-                  }
-                  if (bedrockChunk.usage) {
-                    bedrockChunk.usage.modelName = getTextModel().modelName;
-                    callback(
-                      completeMessage,
-                      false,
-                      false,
-                      bedrockChunk.usage,
-                      completeReasoning
-                    );
-                  }
-                }
-              }
-            }
-            if (done) {
-              callback(
-                completeMessage,
-                true,
-                false,
-                undefined,
-                completeReasoning
-              );
-              return;
-            }
-          } catch (readError) {
-            console.log('Error reading stream:', readError);
-            if (completeMessage === '') {
-              completeMessage = '...';
-            }
-            callback(completeMessage, true, true, undefined, completeReasoning);
-            return;
-          }
-        }
-      })
-      .catch(error => {
-        clearTimeout(timeoutId);
-        if (shouldStop()) {
-          if (completeMessage === '') {
-            completeMessage = '...';
-          }
-          callback(completeMessage, true, true, undefined, completeReasoning);
-        } else {
-          let errorMsg = String(error);
-          if (errorMsg.endsWith('AbortError: Aborted')) {
-            errorMsg = 'Timed out';
-          }
-          if (errorMsg.indexOf('http') >= 0) {
-            errorMsg = 'Unable to resolve host';
-          }
-          const errorInfo = 'Request error: ' + errorMsg;
-          callback(completeMessage + '\n\n' + errorInfo, true, true);
-          console.log(errorInfo);
-        }
-      });
-  } else {
+  {
     const imagePrompt = (
       messages[messages.length - 1].content[0] as TextContent
     ).text;
@@ -321,6 +133,119 @@ export const invokeBedrockWithCallBack = async (
   }
 };
 
+/**
+ * Bedrock Server SSE streaming provider (via App Server API Gateway).
+ * Used by ChatProviderRouter when Bedrock server mode is selected.
+ */
+export const invokeBedrockServerWithCallBack = async (
+  messages: BedrockMessage[],
+  prompt: SystemPrompt | null,
+  shouldStop: () => boolean,
+  controller: AbortController,
+  callback: CallbackFunction
+) => {
+  const bodyObject = {
+    messages: messages,
+    modelId: getTextModel().modelId,
+    region: getRegion(),
+    enableThinking: isEnableThinking(),
+    system: prompt ? [{ text: prompt?.prompt }] : undefined,
+  };
+  if (prompt?.includeHistory === false) {
+    bodyObject.messages = messages.slice(-1);
+  }
+
+  const options = {
+    method: 'POST',
+    headers: getAuthHeaders('application/json'),
+    body: JSON.stringify(bodyObject),
+    signal: controller.signal,
+    reactNative: { textStreaming: true },
+  };
+  const url = getApiPrefix() + '/converse/v3';
+  let completeMessage = '';
+  let completeReasoning = '';
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
+  fetch(url!, options)
+    .then(response => {
+      return response.body;
+    })
+    .then(async body => {
+      clearTimeout(timeoutId);
+      if (!body) {
+        return;
+      }
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        if (shouldStop()) {
+          await reader.cancel();
+          if (completeMessage === '') {
+            completeMessage = '...';
+          }
+          callback(completeMessage, true, true, undefined, completeReasoning);
+          return;
+        }
+
+        try {
+          const { done, value } = await reader.read();
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk.length > 0) {
+            const events = chunk.split('\n\n');
+            for (const event of events) {
+              const bedrockChunk = parseChunk(event);
+              if (bedrockChunk) {
+                if (bedrockChunk.reasoning) {
+                  completeReasoning += bedrockChunk.reasoning ?? '';
+                  callback(completeMessage, false, false, undefined, completeReasoning);
+                }
+                if (bedrockChunk.text) {
+                  completeMessage += bedrockChunk.text ?? '';
+                  callback(completeMessage, false, false, undefined, completeReasoning);
+                }
+                if (bedrockChunk.usage) {
+                  bedrockChunk.usage.modelName = getTextModel().modelName;
+                  callback(completeMessage, false, false, bedrockChunk.usage, completeReasoning);
+                }
+              }
+            }
+          }
+          if (done) {
+            callback(completeMessage, true, false, undefined, completeReasoning);
+            return;
+          }
+        } catch (readError) {
+          console.log('Error reading stream:', readError);
+          if (completeMessage === '') {
+            completeMessage = '...';
+          }
+          callback(completeMessage, true, true, undefined, completeReasoning);
+          return;
+        }
+      }
+    })
+    .catch(error => {
+      clearTimeout(timeoutId);
+      if (shouldStop()) {
+        if (completeMessage === '') {
+          completeMessage = '...';
+        }
+        callback(completeMessage, true, true, undefined, completeReasoning);
+      } else {
+        let errorMsg = String(error);
+        if (errorMsg.endsWith('AbortError: Aborted')) {
+          errorMsg = 'Timed out';
+        }
+        if (errorMsg.indexOf('http') >= 0) {
+          errorMsg = 'Unable to resolve host';
+        }
+        const errorInfo = 'Request error: ' + errorMsg;
+        callback(completeMessage + '\n\n' + errorInfo, true, true);
+        console.log(errorInfo);
+      }
+    });
+};
+
 export const requestAllModels = async (): Promise<AllModel> => {
   if (getApiUrl() === '') {
     return { imageModel: [], textModel: [] };
@@ -332,11 +257,7 @@ export const requestAllModels = async (): Promise<AllModel> => {
   };
   const options = {
     method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      Authorization: 'Bearer ' + getApiKey(),
-    },
+    headers: getAuthHeaders(),
     body: JSON.stringify(bodyObject),
     reactNative: { textStreaming: true },
   };
@@ -354,16 +275,53 @@ export const requestAllModels = async (): Promise<AllModel> => {
       modelName: item.modelName,
       modelTag: ModelTag.Bedrock,
     }));
-    allModel.textModel = allModel.textModel.map((item: Model) => ({
+    const textModel = allModel.textModel.map((item: Model) => ({
       modelId: item.modelId,
       modelName: item.modelName,
       modelTag: ModelTag.Bedrock,
     }));
+    // Merge mantle-served models (GPT-5.x only-on-mantle + apiMode tags).
+    const mantleModelIds = await fetchMantleModelIds();
+    const { models: mantleOnly, openAiIdSet } = buildMantleOnlyModels(
+      mantleModelIds,
+      ModelTag.Bedrock
+    );
+    allModel.textModel = [
+      ...mantleOnly,
+      ...tagModelsWithApiMode(textModel, openAiIdSet),
+    ];
     return allModel;
   } catch (error) {
-    console.log('SwiftChat Server Error fetching models:', error);
+    console.log('App Server Error fetching models:', error);
     clearTimeout(timeoutId);
     return { imageModel: [], textModel: [] };
+  }
+};
+
+// Lists mantle model ids via the App Server proxy for the current region.
+// Best-effort: returns [] on failure so the legacy list still loads.
+const fetchMantleModelIds = async (): Promise<string[]> => {
+  const controller = new AbortController();
+  const url = getApiPrefix() + '/mantle/models';
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ region: getRegion() }),
+      signal: controller.signal,
+      reactNative: { textStreaming: true },
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) {
+      return [];
+    }
+    const json = await response.json();
+    return (json.data ?? []).map((m: { id: string }) => m.id);
+  } catch (error) {
+    clearTimeout(timeoutId);
+    console.log('Mantle models (server) fetch error:', error);
+    return [];
   }
 };
 
@@ -379,11 +337,7 @@ export const requestToken = async (): Promise<TokenResponse | null> => {
 
   const options = {
     method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      Authorization: 'Bearer ' + getApiKey(),
-    },
+    headers: getAuthHeaders(),
     body: JSON.stringify(bodyObject),
     reactNative: { textStreaming: true },
   };
@@ -411,11 +365,7 @@ export const requestUpgradeInfo = async (
   const url = getApiPrefix() + '/upgrade';
   const options = {
     method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      Authorization: 'Bearer ' + getApiKey(),
-    },
+    headers: getAuthHeaders(),
     body: JSON.stringify({
       os: os,
       version: version,
@@ -457,11 +407,7 @@ export const genImage = async (
   };
   const options = {
     method: 'POST',
-    headers: {
-      accept: '*/*',
-      'content-type': 'application/json',
-      Authorization: 'Bearer ' + getApiKey(),
-    },
+    headers: getAuthHeaders('application/json'),
     body: JSON.stringify(bodyObject),
     signal: controller.signal,
     reactNative: { textStreaming: true },
@@ -532,7 +478,7 @@ function parseChunk(part: string) {
         lastUsage = content.usage;
       }
     } catch (innerError) {
-      console.log('DataChunk parse error:' + innerError, part);
+      console.log('DataChunk parse error:', innerError, part);
       return {
         reasoning: combinedReasoning,
         text: part,
@@ -562,12 +508,34 @@ function extractChunkContent(bedrockChunk: BedrockChunk, rawChunk: string) {
   return { reasoning, text, usage };
 }
 
-function getApiPrefix(): string {
+export function getApiPrefix(): string {
   if (isDev) {
     return 'http://localhost:8080/api';
   } else {
     return getApiUrl() + '/api';
   }
+}
+
+export function getAuthHeaders(
+  contentType: string = 'application/json'
+): Record<string, string> {
+  const apiUrl = getApiUrl();
+  // SwiftChat's own deployment uses an API Gateway key (x-api-key). The URL is
+  // either the direct API Gateway endpoint or a CloudFront distribution placed
+  // in front of it — both expect x-api-key. Everything else uses a Bearer token.
+  const isApiGateway =
+    (apiUrl.includes('.execute-api.') && apiUrl.includes('.amazonaws.com')) ||
+    apiUrl.includes('.cloudfront.net');
+  const headers: Record<string, string> = {
+    accept: contentType === 'application/json' ? 'application/json' : '*/*',
+    'content-type': contentType,
+  };
+  if (isApiGateway) {
+    headers['x-api-key'] = getApiKey();
+  } else {
+    headers.Authorization = 'Bearer ' + getApiKey();
+  }
+  return headers;
 }
 
 export const isEnableThinking = (): boolean => {
@@ -579,6 +547,6 @@ const isThinkingModel = (): boolean => {
   return BedrockThinkingModels.includes(textModelName);
 };
 
-function isConfigured(): boolean {
+export function isConfigured(): boolean {
   return getApiPrefix().startsWith('http') && getApiKey().length > 0;
 }

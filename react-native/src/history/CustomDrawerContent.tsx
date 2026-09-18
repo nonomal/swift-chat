@@ -1,14 +1,16 @@
 import * as React from 'react';
 import { useEffect, useRef, useState } from 'react';
 import {
+  Animated,
+  Easing,
   FlatList,
   Image,
-  SafeAreaView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   DrawerContentComponentProps,
   useDrawerStatus,
@@ -22,12 +24,48 @@ import {
 } from '../storage/StorageUtils.ts';
 import Dialog from 'react-native-dialog';
 import { useAppContext } from './AppProvider.tsx';
-import { trigger } from '../chat/util/HapticUtils.ts';
+import { trigger } from '../core/HapticUtils';
 import { HapticFeedbackTypes } from 'react-native-haptic-feedback/src';
 import { groupMessagesByDate } from './HistoryGroupUtil.ts';
 import { isMac } from '../App.tsx';
 import { DrawerActions } from '@react-navigation/native';
 import { useTheme, ColorScheme } from '../theme';
+import { backgroundStreamManager } from '../appgen/service/BackgroundStreamManager';
+
+const breathingDotStyle = StyleSheet.create({
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#34C759',
+    marginRight: 8,
+  },
+});
+
+const BreathingDot: React.FC = () => {
+  const opacity = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    const animation = Animated.loop(
+      Animated.sequence([
+        Animated.timing(opacity, {
+          toValue: 0.3,
+          duration: 1000,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(opacity, {
+          toValue: 1,
+          duration: 1000,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ])
+    );
+    animation.start();
+    return () => animation.stop();
+  }, [opacity]);
+  return <Animated.View style={[breathingDotStyle.dot, { opacity }]} />;
+};
 
 const CustomDrawerContent: React.FC<DrawerContentComponentProps> = ({
   navigation,
@@ -46,11 +84,18 @@ const CustomDrawerContent: React.FC<DrawerContentComponentProps> = ({
   const { event, sendEvent } = useAppContext();
   const { drawerType, setDrawerType } = useAppContext();
 
+  const [activeStreamIds, setActiveStreamIds] = useState<Set<number>>(
+    () => new Set(backgroundStreamManager.getActiveSessionIds())
+  );
   const drawerTypeRef = useRef(drawerType);
   const setDrawerTypeRef = useRef(setDrawerType);
   useEffect(() => {
     drawerTypeRef.current = drawerType;
   }, [drawerType]);
+
+  useEffect(() => {
+    return backgroundStreamManager.onActiveIdsChanged(setActiveStreamIds);
+  }, []);
 
   useEffect(() => {
     groupChatHistoryRef.current = groupChatHistory;
@@ -165,11 +210,7 @@ const CustomDrawerContent: React.FC<DrawerContentComponentProps> = ({
               style={styles.settingsTouch}
               onPress={() => {
                 setDrawerToPermanent();
-                navigation.navigate('Bedrock', {
-                  sessionId: -1,
-                  tapIndex: -2,
-                  mode: ChatMode.Image,
-                });
+                navigation.navigate('ImageGallery');
               }}>
               <Image
                 source={
@@ -180,6 +221,22 @@ const CustomDrawerContent: React.FC<DrawerContentComponentProps> = ({
                 style={styles.settingsLeftImg}
               />
               <Text style={styles.settingsText}>Image</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.settingsTouch}
+              onPress={() => {
+                setDrawerToPermanent();
+                navigation.navigate('AppGallery');
+              }}>
+              <Image
+                source={
+                  isDark
+                    ? require('../assets/app_dark.png')
+                    : require('../assets/app.png')
+                }
+                style={styles.appLeftImg}
+              />
+              <Text style={styles.settingsText}>App</Text>
             </TouchableOpacity>
           </View>
         }
@@ -219,9 +276,12 @@ const CustomDrawerContent: React.FC<DrawerContentComponentProps> = ({
                   isSelected &&
                     (isMac ? styles.macTouchSelected : styles.touchSelected),
                 ]}>
-                <Text numberOfLines={1} style={styles.title}>
-                  {item.title}
-                </Text>
+                <View style={styles.titleRow}>
+                  {activeStreamIds.has(item.id) && <BreathingDot />}
+                  <Text numberOfLines={1} style={styles.titleText}>
+                    {item.title}
+                  </Text>
+                </View>
               </TouchableOpacity>
             );
           }
@@ -296,10 +356,9 @@ const createStyles = (colors: ColorScheme) =>
       height: 24,
       borderRadius: 12,
     },
-    settingsRightImg: {
-      width: 16,
-      height: 16,
-      marginRight: 8,
+    appLeftImg: {
+      width: 24,
+      height: 24,
     },
     flatList: {
       marginVertical: 4,
@@ -331,9 +390,14 @@ const createStyles = (colors: ColorScheme) =>
       fontSize: 14,
       color: colors.textSecondary,
     },
-    title: {
+    titleRow: {
+      flexDirection: 'row' as const,
+      alignItems: 'center' as const,
+    },
+    titleText: {
       fontSize: 16,
       color: colors.text,
+      flex: 1,
     },
   });
 
